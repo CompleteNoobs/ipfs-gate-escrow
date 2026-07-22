@@ -8,11 +8,13 @@ is a keyless reporter: it sends signed `event-report` messages over escrow-proto
 (Nostr kind-31337, inner schnorr signature is the trust gate) and finalizes on the box's
 signed `settlement-receipt`.
 
-> **Status: Phase 0 scaffold.** Files imported verbatim from
-> [v4call-escrow](https://github.com/CompleteNoobs/v4call-escrow) @`946c7a6` and NOT yet
-> adapted — they still speak v4call (call settlement, ring fees). Phase 2 of
-> `../decoupling-notes/ipfs-gate-split-plan.md` adapts them to ipfs-gate claim settlement
-> via `escrow-core/adapters/ipfs-gate.js` (built in Phase 1).
+> **Status: Phase 2 BUILT** (adapted from
+> [v4call-escrow](https://github.com/CompleteNoobs/v4call-escrow) @`946c7a6`): claim-settle
+> dispatch via `escrow-core/adapters/ipfs-gate.js`, owner-is-payer guard, memo-probe
+> disburse recovery, completion receipts, Dockerfile + compose (NEW — v4call's box is
+> bare OpenRC only). 20/20 box tests + 11/11 adversarial dry-run green (`npm test`,
+> `npm run dry-run`). Next per `../decoupling-notes/ipfs-gate-split-plan.md`: Phase 3
+> node flip, Phase 4 LXC integration.
 
 Two money invariants (inherited from escrow-core, originally extracted from ipfs-gate itself):
 

@@ -1,0 +1,20 @@
+# ── ipfs-gate-escrow standalone compose (box-only host) ──────────────────────
+# For a dedicated escrow VPS running the box as a container (the alternative to
+# the bare-OpenRC deploy in walkthrough.wiki). The single-server combined stack
+# (node + kubo + nginx + escrow on one box) lives in ipfs-gate-node's
+# docker-compose.yml under `--profile escrow` and builds this same image.
+#
+# Before `docker compose build`: npm run docker:prep   (vendors ../escrow-core)
+# .env holds IPFS_GATE_ACTIVE_KEY — this host only, never the node's.
+services:
+  ipfs-gate-escrow:
+    build: .
+    container_name: ipfs-gate-escrow
+    env_file: ./.env
+    environment:
+      - ESCROW_DB_PATH=/app/data/ipfs-gate-escrow.db
+      - ESCROW_KEY_PATH=/app/data/escrow-reporting-key.json
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    # No ports: the box is outbound-only (Hive RPC over HTTPS, relay over WSS).

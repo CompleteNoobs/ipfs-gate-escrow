@@ -1,61 +1,48 @@
-// ── v4call-escrow/escrow-box.js — the isolated money box (the SETTLEMENT AUTHORITY) ──
+// ── ipfs-gate-escrow/escrow-box.js — the isolated money box (the SETTLEMENT AUTHORITY) ──
 //
-// This is the thin wrapper around escrow-core that makes the box — NOT the node — the
-// money authority (handover-escrow-core §4/§9.1; decoupling handoff item 1). The box
-// holds the ONLY active key, its OWN durable ledger, and is the only place a
-// disbursement is computed and signed. The node becomes a keyless reporter: it sends a
-// signed `event-report` describing a call that ended; the box independently re-establishes
-// the money facts ON-CHAIN and settles.
+// Adapted from v4call-escrow/escrow-box.js@946c7a6 (the proven box). The generic
+// machinery — hard gates, nonce dedup, on-chain re-verify, synchronous commit,
+// disburse lifecycle, memo-probe recovery, receipts — is carried over unchanged;
+// the v4call call-end settle path (ring/connect carve-out, callee/fee split,
+// attestations) is replaced by ipfs-gate CLAIM settlement.
 //
 // THE SAFETY PROPERTY (why a compromised node can't drain funds):
-//   The box verifies EVERY escrowed payment (ring/connect/deposit/topup) on-chain itself
-//   (escrow-core.verifyPayment, tx-anchored + exact-memo) and only ever disburses within
-//   that verified envelope. The split (adapter.settlementSplit) conserves the envelope:
-//       payout + refund + fee  ==  ring + connect + deposit − dust   (for ANY rate/fee/duration)
-//   So a lying report can only RE-SPLIT a call's verified deposit between caller/callee/
-//   platform — never mint money, never exceed what was actually escrowed for that call.
-//   The report's signature gate (verifyReport against the node's on-chain-bound reporting
-//   key) + the nonce one-shot stop spoofed/replayed *settlements*; the on-chain verify +
-//   the conservation are what stop *minting*.
+//   The box verifies EVERY escrowed payment (upload/guardian/owncopy/extend) on-chain
+//   itself (escrow-core.verifyPayment, tx-anchored + exact-memo) and only ever
+//   disburses within that verified envelope. ipfs-gate's split is the simplest case:
+//       refund(→ claim owner) + retained(stays in escrow)  ==  verified envelope − dust
+//   So a lying report can only RE-SPLIT a claim's verified deposits between the owner
+//   and the operator — never mint money, never pay a third party (the box additionally
+//   REQUIRES the refund recipient to be the verified payer of the deposits).
 //
-// IDEMPOTENCY (no double-disburse, ever): two durable guards, exactly as in-process today.
+// IDEMPOTENCY (no double-disburse, ever): two durable guards, exactly as in-process.
 //   - tx_id UNIQUE  → a replayed payment can't be recorded (or counted) twice.
-//   - atomicClose() → a single-winner state flip; a redelivered report / crash-retry / two
-//     concurrent reports for the same ref produce exactly ONE settlement.
+//   - atomicClose() → a single-winner state flip; a redelivered report / crash-retry /
+//     two concurrent reports for the same ref produce exactly ONE settlement.
 //
 // PURE + INJECTABLE (so it is provable offline): all I/O is injected — `transport`
-// (subscribe/publish), `deps.getTransaction` (chain reads for verifyPayment),
-// `deps.broadcastClient` (the dhive client for disburse), `deps.verifySidechain`,
-// `deps.now`. The real Nostr transport + real chain live in index.js / nostr-transport.js;
-// the tests drive handleReport() directly with a loopback transport and a mock chain.
+// (subscribe/publish), `deps.getTransaction` (chain reads), `deps.broadcastClient`,
+// `deps.verifySidechain`, `deps.now`. Tests drive handleReport() directly.
 //
-// NO CLAUDE ON THE MONEY BOX (guardrail): this file is developed/tested on a dev host; the
-// production box runs it on a minimal Alpine host with no dev tooling.
+// NO CLAUDE ON THE MONEY BOX (guardrail): developed/tested on a dev host; the
+// production box runs it on a minimal host with no dev tooling.
 
 'use strict';
 
-// Purposes whose on-chain amount forms the refundable DEPOSIT cap (vs the non-refundable
-// ring/connect buckets, both part of the callee gross — ring-fee model, OWNER 2026-07-07).
-// Classification is by the on-chain-verified
-// memo purpose (`namespace:purpose:reservationId`), so it can't be spoofed by the node.
-// MUST mirror the settle-step bucket rule exactly (step 5: "call/deposit/topup/unknown →
-// refundable cap"): everything that is NOT an explicit ring/connect transfer is deposit.
-// The live client's combined transfer uses purpose `pay` (`v4call:pay:<callId>:<callee>`);
-// classifying with a purpose whitelist here while step 5 used a ring/connect blacklist made
-// every real box-mode call reject with asserted_split_exceeds_deposit (fed testing 2026-07-07).
-const NON_DEPOSIT_PURPOSES = new Set(['ring', 'connect']);
+// Purposes whose on-chain amount does NOT form the refundable deposit envelope.
+// BLACKLIST, not whitelist (the proven v4call lesson — a whitelist rejected every
+// real payment when a new purpose appeared): everything that is not an explicit
+// escrow OUTFLOW memo counts toward the deposit cap. ipfs-gate deposit purposes
+// today: upload, guardian (legacy backstop), owncopy, extend — and any future one
+// just works.
+const NON_DEPOSIT_PURPOSES = new Set(['refund', 'fee']);
 const isDepositPurpose = (p) => !NON_DEPOSIT_PURPOSES.has(p);
 
 function isTransient(err) {
   // escrow-core.verifyPayment throws CODED errors for every on-chain verdict:
-  //   'bad_request'          → missing/invalid params (structural)
-  //   'unprocessable_entity' → the tx doesn't prove the payment (wrong account/currency/
-  //                            amount/memo, no matching op, or — after verifyPayment's own
-  //                            5× confirmation-lag retries — not found). All structural.
-  // Anything WITHOUT one of those codes is a thrown network/timeout (e.g. "All Hive nodes
-  // failed") → transient. We must NOT finalize a settlement on incomplete data: a transient
-  // error returns 'retry' (the node re-reports) BEFORE atomicClose, so nothing is lost; a
-  // structural error DROPS that one payment (a forged/wrong tx can't enter the envelope).
+  //   'bad_request' / 'unprocessable_entity' → structural (forged / wrong memo / not found).
+  // Anything WITHOUT one of those codes is a thrown network/timeout → transient.
+  // Transient returns 'retry' BEFORE any close; structural DROPS that one payment.
   if (!err) return false;
   return err.code !== 'bad_request' && err.code !== 'unprocessable_entity';
 }
@@ -65,10 +52,10 @@ function isTransient(err) {
  *
  * @param escrowCore  require('escrow-core')
  * @param ledger      escrowCore.openLedger(dbPath, { adapterMigrations: adapter.ledgerMigrations() })
- * @param adapter     escrowCore.createV4callAdapter({ account, currency, keyEnv })
- * @param config      { account, currency, keyEnv, feeAccount, expectedReporters:[pubkeyHex…], maxDurationMin? }
- * @param boxSkHex    64-hex schnorr sk for SIGNING settlement-receipts (the box's escrow-reporting key)
- * @param deps        { getTransaction, broadcastClient, verifySidechain?, now? }  (injected; defaults = live)
+ * @param adapter     escrowCore.createIpfsGateAdapter({ account, currency, keyEnv, cancelFeePct, minRefund })
+ * @param config      { account, currency, keyEnv, expectedReporters:[pubkeyHex…] }
+ * @param boxSkHex    64-hex schnorr sk for SIGNING settlement-receipts
+ * @param deps        { getTransaction, broadcastClient, verifySidechain?, now?, transport? }
  * @param log         (level, msg) => void
  */
 function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps = {}, log = () => {} }) {
@@ -83,9 +70,8 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
 
   // PERMANENT rejection of an AUTHORIZED, signature-valid report → also return a signed
   // status:'failed' receipt so the node's retry-until-received drainer gets a terminal
-  // answer and stops republishing (without this a structurally-bad report loops forever).
-  // Never used for the hard gates (bad sig / unauthorized reporter) — those stay silent:
-  // an untrusted counterparty gets no receipt oracle. Transient errors keep status:'retry'.
+  // answer and stops republishing. Never used for the hard gates (bad sig / unauthorized
+  // reporter) — those stay silent: an untrusted counterparty gets no receipt oracle.
   const rejectTerminal = (ref, reason, currency) => {
     log('warn', `report rejected TERMINALLY (ref=${ref}): ${reason}`);
     const receipt = escrowCore.buildSettlementReceipt({
@@ -96,8 +82,7 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
   };
 
   function authorizedReporter(pubkey) {
-    // If no allow-list is configured the box refuses ALL reports (fail closed) — a money
-    // box must know which reporting key(s) it trusts.
+    // No allow-list configured → the box refuses ALL reports (fail closed).
     return !!pubkey && expectedReporters.has(pubkey);
   }
 
@@ -105,12 +90,8 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
     return adapter.precision(currency || config.currency);
   }
 
-  // Resolve a payment currency's TRUE on-chain precision before any money math.
-  // Without this the registry default (3dp) silently rounds 8dp-token payouts
-  // (e.g. 0.9225 TEST → 0.923) and would BREAK <3dp-precision tokens outright.
-  // escrowCore.resolvePrecision caches into the registry, so every later sync
-  // placesFor()/roundCoins() in this settlement sees the real value. Fail-safe:
-  // a failed lookup falls back to the default for THIS settlement and retries later.
+  // Resolve a payment currency's TRUE on-chain precision before any money math
+  // (8dp HE tokens vs the 3dp registry default). Cached; fail-safe on lookup error.
   async function resolveCurrencyPrecision(cur) {
     try { await (deps.resolvePrecision || escrowCore.resolvePrecision)(cur); }
     catch (e) { log('warn', `precision resolve ${cur}: ${e.message}`); }
@@ -118,10 +99,7 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
 
   // Map a disburse error to a durable-row disposition. TRANSIENT (network) + no_key
   // are RETRYABLE → leave the row 'pending' (disbursePending re-attempts after an
-  // on-chain idempotency probe, so a landed-but-lost-response tx is never double-paid).
-  // Only a PERMANENT failure (bad sig / insufficient balance / RC / malformed) is the
-  // terminal 'failed'. Belt-and-braces re-classify raw errors in case a transport
-  // bypassed escrow-core's classifier; unknown shapes fail closed to 'failed'.
+  // on-chain idempotency probe). Only a PERMANENT failure is the terminal 'failed'.
   function dispositionForDisburseError(e) {
     if (e && (e.code === 'no_key' || e.code === 'transient')) return 'pending';
     try { if (escrowCore.classifyBroadcastError && escrowCore.classifyBroadcastError(e) === 'transient') return 'pending'; } catch {}
@@ -129,18 +107,50 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
   }
 
   // Build a settlement-receipt from the durable state of an already-settled ref, so a
-  // redelivered report gets the SAME answer without re-disbursing.
+  // redelivered report gets the SAME answer without re-disbursing. ipfs-gate outflows
+  // are all refunds (reason = the settle trigger); settlement (the retained portion)
+  // is not reconstructable from the refunds table alone — the receipt's job here is
+  // the refund status, so it reports settlement 0 with the summed refunds.
   function receiptFromLedger(ref, status) {
     const refunds = ledger.db.prepare('SELECT * FROM refunds WHERE ref = ?').all(ref);
-    const byReason = (r) => refunds.filter(x => x.reason === r).reduce((s, x) => s + Number(x.amount || 0), 0);
-    const payout = refunds.find(r => r.reason === 'payout');
+    const total = refunds.reduce((s, x) => s + Number(x.amount || 0), 0);
+    const first = refunds.find(r => r.tx_id);
     const currency = refunds[0] ? refunds[0].currency : config.currency;
     const receipt = escrowCore.buildSettlementReceipt({
-      ref, settlement: byReason('payout'), refund: byReason('refund'),
-      dust: 0, currency, disburseTx: (payout && payout.tx_id) || null,
+      ref, settlement: 0, refund: total,
+      dust: 0, currency, disburseTx: (first && first.tx_id) || null,
       status: status || 'settled', createdAt: nowFn(),
     });
     return boxSkHex ? escrowCore.signReport(receipt, boxSkHex) : receipt;
+  }
+
+  // Disburse one recorded outflow row; shared by claim-settle and single-payment.
+  async function disburseOutflows(ref, outflows, places) {
+    let disburseTx = null, overall = 'settled';
+    for (const o of outflows) {
+      const { refund_id } = ledger.recordRefund({
+        ref, to_account: o.to_account, amount: o.amount, currency: o.currency, memo: o.memo, reason: o.reason });
+      try {
+        const { txId } = await escrowCore.disburse(
+          { to: o.to_account, amount: o.amount, currency: o.currency, memo: o.memo,
+            fromAccount: config.account, keyEnv: config.keyEnv, places },
+          { client: deps.broadcastClient }
+        );
+        ledger.markRefundSettled(refund_id, 'sent', txId);
+        o.txId = txId; o.status = 'sent';
+        if (!disburseTx) disburseTx = txId;
+      } catch (e) {
+        if (dispositionForDisburseError(e) === 'pending') {
+          o.status = 'pending'; if (overall === 'settled') overall = 'pending';
+          log('error', `disburse ${o.kind} → ${o.to_account} left PENDING (retryable ${e.code || 'net'}): ${e.message}`);
+        } else {
+          ledger.markRefundSettled(refund_id, 'failed', null);
+          o.status = 'failed'; overall = 'failed';
+          log('error', `disburse ${o.kind} → ${o.to_account} FAILED (permanent): ${e.message}`);
+        }
+      }
+    }
+    return { disburseTx, overall };
   }
 
   /**
@@ -149,9 +159,7 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
    *   { status:'duplicate'|'already_settled', ref, receipt? }           — idempotent no-op
    *   { status:'retry', ref, reason }                                   — transient; node re-reports
    *   { status:'rejected', ref, reason }                                — bad sig / unauthorized (silent)
-   *   { status:'rejected', ref, reason, receipt }                       — authorized but structurally bad:
-   *                                                                       carries a signed status:'failed'
-   *                                                                       receipt so the node stops retrying
+   *   { status:'rejected', ref, reason, receipt }                       — authorized but structurally bad
    */
   async function handleReport(signed) {
     const ref = signed && signed.ref;
@@ -164,32 +172,34 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
     if (!authorizedReporter(signed.pubkey)) return reject(ref, `unauthorized reporter pubkey ${signed.pubkey}`);
     if (!escrowCore.verifyReport(signed, signed.pubkey)) return reject(ref, 'bad signature');
 
-    // 3. Fast-path dedup — a nonce we've already SETTLED in-process is an immediate no-op.
-    //    Read-only here (has, not markSeen): we only CONSUME the nonce after a successful
-    //    atomicClose below, so a transient-retry (which reuses the stable `ref:settle` nonce)
-    //    is never wrongly blocked. The durable guards (tx_id UNIQUE + atomicClose) are the
-    //    authoritative idempotency across restarts/concurrency; this is just a fast path.
+    // 3. Fast-path dedup — read-only here (has, not markSeen): the nonce is only CONSUMED
+    //    after a successful atomicClose, so a transient-retry (stable `ref:settle` nonce)
+    //    is never wrongly blocked. Durable guards are the authority across restarts.
     if (seen.has(signed.nonce)) {
       log('info', `duplicate report (nonce seen) ref=${ref}`);
       return { status: 'duplicate', ref };
     }
 
     const facts = signed.facts || {};
-
-    // Single-payment settlements (paid DMs/attachments/invites/ring-fee refunds) have no
-    // duration/cap/ring-connect-deposit concept — a distinct, much simpler handler.
     if (facts.kind === 'single-payment') return handleSinglePayment(signed, ref, facts);
+    if (facts.kind !== 'claim-settle') return rejectTerminal(ref, `unknown report kind '${facts.kind}'`, facts.currency);
 
-    const callFacts = facts.callFacts || {};
+    const claimFacts = facts.claimFacts || {};
+    const trigger = facts.trigger || 'cancel';
     const payments = Array.isArray(facts.payments) ? facts.payments : [];
 
-    // Resolve every distinct payment currency's true precision up front (see helper).
+    if (!claimFacts.owner) return rejectTerminal(ref, 'claimFacts.owner required', facts.currency);
+    if (claimFacts.claim_id && claimFacts.claim_id !== ref) {
+      return rejectTerminal(ref, `ref/claim_id mismatch (${claimFacts.claim_id})`, facts.currency);
+    }
+
+    // Resolve every distinct payment currency's true precision up front.
     for (const cur of new Set([facts.currency, ...payments.map(p => p.currency)].filter(Boolean))) {
       await resolveCurrencyPrecision(cur);
     }
 
     // 4. Independently VERIFY each escrowed payment on-chain (the verified envelope).
-    //    Collect the verified set; abort to 'retry' on a transient error BEFORE any close.
+    //    Abort to 'retry' on a transient error BEFORE any close; drop forged rows.
     const verified = [];
     for (const p of payments) {
       const currency = p.currency || config.currency;
@@ -205,79 +215,54 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
         log('warn', `dropping payment ${p.txId} (structural verify failure): ${e.message}`);
         continue; // forged / wrong-memo payment can't enter the envelope
       }
-      // Hive-Engine tokens need the sidechain hard-confirm (Hive-layer broadcast succeeding
-      // does NOT mean the sidechain accepted it). Defaults to the live escrow-core check;
-      // tests inject a mock. Native HIVE/HBD skip it.
+      // Hive-Engine tokens need the sidechain hard-confirm; native HIVE/HBD skip it.
       const verifySidechain = deps.verifySidechain || escrowCore.verifySidechain;
       if (!escrowCore.isNativeCurrency(v.currency) && verifySidechain) {
         try { await verifySidechain(p.txId); }
         catch (e) { if (isTransient(e)) return { status: 'retry', ref, reason: `sidechain ${p.txId}: ${e.message}` };
                     log('warn', `dropping HE payment ${p.txId} (sidechain reject): ${e.message}`); continue; }
       }
-      const purpose = (escrowCore.parseMemo(p.memo) || {}).purpose || p.purpose || 'deposit';
+      const purpose = (escrowCore.parseMemo(p.memo) || {}).purpose || p.purpose || 'upload';
       verified.push({ v, purpose, memo: p.memo });
     }
 
-    // 4b. Pre-commit guard for the combined-transfer re-split (Option B). The node may fund
-    // ring+connect+deposit as ONE on-chain transfer and ASSERT the non-refundable ring/connect
-    // portions via callFacts (applied in step 5b). Reject — BEFORE recording/closing anything,
-    // so a corrected re-report can still settle — a report that asserts MORE ring+connect than
-    // the verified deposit envelope holds (you can't re-split money that isn't there). An honest
-    // node's assertions are always components of the verified deposit total; this only fires on a
-    // malformed/adversarial report.
-    const assertRing0    = Math.max(0, Number(callFacts.ringPaid)    || 0);
-    const assertConnect0 = Math.max(0, Number(callFacts.connectPaid) || 0);
-    if (assertRing0 + assertConnect0 > 0) {
-      const depositVerified = verified.reduce((s, x) =>
-        s + (isDepositPurpose(x.purpose) ? (Number(x.v.paid) || 0) : 0), 0);
-      const guardFloor = Math.pow(10, -placesFor((verified[0] && verified[0].v.currency) || config.currency));
-      if (assertRing0 + assertConnect0 > depositVerified + guardFloor) {
-        return rejectTerminal(ref, 'asserted_split_exceeds_deposit', facts.currency);
-      }
-    }
-
-    // 4c. Step 6 — call attestations (SHADOW MODE). Caller/callee co-signed views of the
-    // call facts ride in facts.attestations; verify each INDEPENDENTLY of the reporting
-    // node (ECDSA-recover → the account's on-chain posting keys — a lying node can't
-    // forge these without the users' keys) and log the verdict. Shadow = verify + log +
-    // stamp the receipt, settle exactly as before. ATTESTATION_ENFORCE=true (the Step-6
-    // promotion flag; config.attestationEnforce) instead TERMINALLY rejects a call-end
-    // whose attestations are absent/invalid — still pre-commit, so a corrected re-report
-    // can settle. Verification is fail-soft: a chain outage yields 'unverifiable', which
-    // shadow logs and enforce treats as not-ok (fail closed).
-    let attVerdict = null;
-    {
-      const attCaller = (verified[0] && verified[0].v.sender) || (facts.payments[0] && facts.payments[0].sender) || null;
-      attVerdict = await escrowCore.verifyCallAttestationSet(
-        facts.attestations,
-        { callId: ref, caller: attCaller, callee: callFacts.callee, durationMs: Number(facts.durationMs) || 0 },
-        { getAccountPostingPubkeys: deps.getAccountPostingPubkeys || escrowCore.getAccountPostingPubkeys }
-      );
-      log('info', `attestation ${config.attestationEnforce ? 'ENFORCE' : 'shadow'} ${ref}: caller=${attVerdict.caller} callee=${attVerdict.callee} (reported ${Math.round((Number(facts.durationMs) || 0) / 1000)}s)`);
-      if (config.attestationEnforce && !attVerdict.ok) {
-        return rejectTerminal(ref, `attestation_failed:caller=${attVerdict.caller},callee=${attVerdict.callee}`, facts.currency);
+    // 4b. Pre-commit guard: OWNER IS THE PAYER. Every monolith claim payment is verified
+    // with sender = the claim owner (upload/reserve, guardian pledge, own-copy, extend —
+    // server.js verifyPayment call sites), and the refund outflow goes to the owner. A
+    // report whose verified deposits were paid by someone ELSE than the asserted refund
+    // recipient is structurally wrong (or an attempted redirect) → terminal, pre-commit,
+    // so a corrected re-report can still settle.
+    for (const x of verified) {
+      if (isDepositPurpose(x.purpose) && x.v.sender !== claimFacts.owner) {
+        return rejectTerminal(ref, `payment_sender_mismatch: ${x.v.txId} paid by ${x.v.sender}, owner ${claimFacts.owner}`, facts.currency);
       }
     }
 
     // ── SYNCHRONOUS commit section (no await): record + single-winner close atomically. ──
-    // A ref that ALREADY has a closed row is settled — ignore (this also blocks an attacker
-    // appending a fresh payment to a settled ref to retrigger settlement).
     const pre = ledger.getPaymentsByRef(ref);
     if (pre.some(r => r.settle_state === 'closed')) {
       log('info', `ref ${ref} already settled — returning prior receipt`);
       return { status: 'already_settled', ref, receipt: receiptFromLedger(ref) };
     }
     for (const { v, memo, purpose } of verified) {
-      // Base columns; the memo is what classifies the purpose (on-chain-verified).
       const row = { tx_id: v.txId, ref, sender: v.sender, currency: v.currency, amount: v.paid,
         memo, block_num: v.blockNum };
-      // Per-call locked facts (node-asserted; only ever re-split the verified envelope) are
-      // persisted on the DEPOSIT rows so a crash-recovering box can settle without the report.
+      // Claim facts (node-asserted; can only ever re-split the verified envelope) are
+      // persisted on the DEPOSIT rows so a crash-recovering box can settle without the
+      // report. cancel_fee_pct is the BOX's authoritative knob, never the node's.
       if (isDepositPurpose(purpose)) {
-        if (callFacts.ratePerHour  != null) row.rate_per_hour = Number(callFacts.ratePerHour);
-        if (callFacts.startTs      != null) row.start_ts      = Number(callFacts.startTs);
-        if (callFacts.platformFee  != null) row.platform_fee  = Number(callFacts.platformFee);
-        if (callFacts.callee       != null) row.callee        = callFacts.callee;
+        row.claim_id = ref;
+        row.owner = claimFacts.owner;
+        if (claimFacts.claim_kind      != null) row.claim_kind       = String(claimFacts.claim_kind);
+        if (claimFacts.claim_state     != null) row.claim_state      = String(claimFacts.claim_state);
+        if (claimFacts.rate_locked     != null) row.rate_locked      = Number(claimFacts.rate_locked);
+        if (claimFacts.size_bytes      != null) row.size_bytes       = Number(claimFacts.size_bytes);
+        if (claimFacts.copies_requested != null) row.copies_requested = Number(claimFacts.copies_requested);
+        if (claimFacts.paid_hours      != null) row.paid_hours       = Number(claimFacts.paid_hours);
+        if (claimFacts.start_ts        != null) row.start_ts         = Number(claimFacts.start_ts);
+        if (claimFacts.expiry_ts       != null) row.expiry_ts        = Number(claimFacts.expiry_ts);
+        row.cancel_fee_pct = adapter.cancelFeePct;
+        row.settle_trigger = trigger;
       }
       try {
         ledger.recordPayment(row);
@@ -295,122 +280,74 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
       log('info', `ref ${ref} lost atomicClose race — already settling/settled`);
       return { status: 'already_settled', ref, receipt: receiptFromLedger(ref) };
     }
-    seen.markSeen(signed.nonce); // we won the close → consume the nonce (in-process fast-path)
+    seen.markSeen(signed.nonce); // we won the close → consume the nonce
     // ── end synchronous commit section ──
 
-    // 5. Derive money facts from the DURABLE rows (the authority), classified by verified memo.
-    const bucket = { ring: 0, connect: 0, deposit: 0 };
+    // 5. Derive money facts from the DURABLE rows (the authority). The refundable
+    // envelope is the SUM of deposit-purpose rows — the original upload/pledge/
+    // owncopy deposit plus every extend top-up (extendClaim never bumps the
+    // monolith's amount_paid, so the envelope is the only correct cap).
+    let deposit = 0;
     for (const r of payRows) {
-      const purpose = (escrowCore.parseMemo(r.memo) || {}).purpose || 'deposit';
-      if (purpose === 'ring') bucket.ring += Number(r.amount) || 0;
-      else if (purpose === 'connect') bucket.connect += Number(r.amount) || 0;
-      else bucket.deposit += Number(r.amount) || 0; // call/deposit/topup/unknown → refundable cap
+      const purpose = (escrowCore.parseMemo(r.memo) || {}).purpose || 'upload';
+      if (isDepositPurpose(purpose)) deposit += Number(r.amount) || 0;
     }
-    const primary = payRows.find(r => r.rate_per_hour != null) || payRows[0];
-    const currency    = primary.currency || config.currency;
-    const ratePerHour = Number(primary.rate_per_hour) || 0;
-    const platformFee = (primary.platform_fee != null) ? Number(primary.platform_fee) : 0.10;
-    const callee      = primary.callee || callFacts.callee;
-    const caller      = primary.sender;
-    const startTs     = (primary.start_ts != null) ? Number(primary.start_ts) : Number(callFacts.startTs) || 0;
-    const places      = placesFor(currency);
-    const floor       = Math.pow(10, -places);
-    const now         = nowFn();
+    const primary = payRows.find(r => r.claim_id != null) || payRows[0];
+    const currency = primary.currency || config.currency;
+    const places = placesFor(currency);
+    const now = nowFn();
+    deposit = escrowCore.roundCoins(deposit, currency, places);
 
-    // 5b. Combined-transfer re-split. When the node funds ring+connect+deposit as ONE on-chain
-    // transfer, ring/connect arrive folded INTO the deposit bucket (a single deposit-purpose,
-    // on-chain-verified payment). The node ASSERTS how much of that verified deposit total is
-    // actually the non-refundable ring (→fee) / connect (→callee) via callFacts. We only ever
-    // CARVE these OUT of the already-verified deposit bucket — the envelope total
-    // (ring+connect+deposit == V) is unchanged, so a lying assertion can only RE-SPLIT, never
-    // mint. (Additive with the memo classification above: when ring/connect were their own
-    // on-chain transfers, callFacts carries no assertion and this is a no-op.) An assertion that
-    // tries to carve more than the verified deposit holds is rejected.
-    // (Validated pre-commit at 4b — carve <= verified deposit; here we just apply it to the
-    // durable-row buckets. ring/connect each gain exactly the asserted amount and deposit loses
-    // their sum, so the envelope total is unchanged; Math.max(0,…) only absorbs sub-floor
-    // rounding noise.)
-    const assertRing    = Math.max(0, Number(callFacts.ringPaid)    || 0);
-    const assertConnect = Math.max(0, Number(callFacts.connectPaid) || 0);
-    const carve = assertRing + assertConnect;
-    if (carve > 0) {
-      bucket.ring    = escrowCore.roundCoins(bucket.ring + assertRing, currency, places);
-      bucket.connect = escrowCore.roundCoins(bucket.connect + assertConnect, currency, places);
-      bucket.deposit = Math.max(0, escrowCore.roundCoins(bucket.deposit - carve, currency, places));
-    }
+    // 6. Metering + the cap (the money-safety invariant) — escrow-core.settle, never inline.
+    // The dust floor is the monolith's MIN_REFUND (box-authoritative adapter knob), so
+    // sub-floor refunds are retained exactly as broadcastRefund's 'skipped' path.
+    const record = {
+      trigger, deposit, currency,
+      claim_state: primary.claim_state ?? claimFacts.claim_state,
+      rate_locked: primary.rate_locked ?? claimFacts.rate_locked,
+      size_bytes: primary.size_bytes ?? claimFacts.size_bytes,
+      copies_requested: primary.copies_requested ?? claimFacts.copies_requested,
+      paid_hours: primary.paid_hours ?? claimFacts.paid_hours,
+      start_ts: primary.start_ts ?? claimFacts.start_ts,
+      expiry_ts: primary.expiry_ts ?? claimFacts.expiry_ts,
+      cancel_fee_pct: adapter.cancelFeePct,
+    };
+    const meteredUsage = adapter.meteredUsage(record, now);
+    const settled = escrowCore.settle({ deposit, meteredUsage, currency, places, dustFloor: adapter.minRefund });
 
-    // 6. Cap (the money-safety invariant) — computed by escrow-core.settle, never inline.
-    const meteredUsage = adapter.meteredUsage(
-      { rate_per_hour: ratePerHour, start_ts: startTs, max_duration_min: config.maxDurationMin }, now);
-    const settled = escrowCore.settle({ deposit: bucket.deposit, meteredUsage, currency, places, dustFloor: floor });
-    const durationMin = startTs ? Math.min((now - startTs) / 60000, config.maxDurationMin || Infinity) : 0;
-
-    // 7. v4call split (payout/refund/fee) — the adapter's per-service seam; conserves the envelope.
+    // 7. ipfs-gate split — at most ONE outflow: the refund to the verified owner.
     const split = adapter.settlementSplit(
-      { connect_paid: bucket.connect, ring_paid: bucket.ring, platform_fee: platformFee,
-        callee, caller, currency },
+      { owner: primary.owner || claimFacts.owner, currency, trigger },
       settled,
-      { ref, feeAccount: config.feeAccount, durationMin, places }
+      { ref, places }
     );
 
     // 8. Durable refund lifecycle → disburse with the box key → mark sent/pending/failed.
-    let payoutTx = null, overall = 'settled';
-    for (const o of split.outflows) {
-      const { refund_id } = ledger.recordRefund({
-        ref, to_account: o.to_account, amount: o.amount, currency: o.currency, memo: o.memo, reason: o.reason });
-      try {
-        const { txId } = await escrowCore.disburse(
-          { to: o.to_account, amount: o.amount, currency: o.currency, memo: o.memo,
-            fromAccount: config.account, keyEnv: config.keyEnv, places },
-          { client: deps.broadcastClient }
-        );
-        ledger.markRefundSettled(refund_id, 'sent', txId);
-        o.txId = txId; o.status = 'sent';
-        if (o.kind === 'payout') payoutTx = txId;
-      } catch (e) {
-        if (dispositionForDisburseError(e) === 'pending') {
-          // retryable (transient network / no key) — leave 'pending'; disbursePending
-          // re-attempts after an idempotency probe. NEVER double-paid.
-          o.status = 'pending'; if (overall === 'settled') overall = 'pending';
-          log('error', `disburse ${o.kind} → ${o.to_account} left PENDING (retryable ${e.code || 'net'}): ${e.message}`);
-        } else {
-          ledger.markRefundSettled(refund_id, 'failed', null);
-          o.status = 'failed'; overall = 'failed';
-          log('error', `disburse ${o.kind} → ${o.to_account} FAILED (permanent): ${e.message}`);
-        }
-      }
-    }
+    const { disburseTx, overall } = await disburseOutflows(ref, split.outflows, places);
 
     // 9. Signed settlement-receipt back to the node.
     const receipt = escrowCore.buildSettlementReceipt({
       ref, settlement: settled.settlement, refund: settled.refund, dust: settled.dust,
-      currency, disburseTx: payoutTx, status: overall, createdAt: now });
-    // Step-6 shadow verdict rides ON the signed receipt so the node (and its logs/UI)
-    // sees what the box concluded about the co-signed call facts.
-    if (attVerdict && attVerdict.anyPresent) {
-      receipt.attestations = { caller: attVerdict.caller, callee: attVerdict.callee, ok: attVerdict.ok };
-    }
+      currency, disburseTx, status: overall, createdAt: now });
     const signedReceipt = boxSkHex ? escrowCore.signReport(receipt, boxSkHex) : receipt;
 
-    log('info', `settled ${ref}: payout/refund/fee, status=${overall}`);
+    log('info', `settled ${ref} (${trigger}): refund=${settled.refund} retained=${settled.settlement} status=${overall}`);
     return { status: overall, ref, receipt: signedReceipt, outflows: split.outflows };
   }
 
   /**
-   * Handle a single-payment report (paid DMs/attachments/invites/ring-fee refunds — anything
-   * that isn't a metered call). Verifies the ONE reported on-chain payment itself (never trusts
-   * the node's claimed amount), splits gross → net (to facts.payoutTo) + fee (to config.feeAccount)
-   * via adapter.singlePaymentSplit, and disburses. platformFee 0 in the facts collapses this to a
-   * pure refund. Same idempotency guards as handleReport (tx_id UNIQUE, atomicClose, nonce).
+   * Handle a single-payment report — one-off refunds outside the claim lifecycle
+   * (e.g. a future admin orphan-payment refund path). Verifies the ONE reported
+   * on-chain payment itself, splits via adapter.singlePaymentSplit (platformFee 0
+   * = pure refund), disburses. Same idempotency guards as handleReport.
    */
   async function handleSinglePayment(signed, ref, facts) {
     const payments = Array.isArray(facts.payments) ? facts.payments : [];
     if (payments.length !== 1) return rejectTerminal(ref, 'single-payment report must carry exactly one payment', facts.currency);
     const p = payments[0];
     const currency = p.currency || facts.currency || config.currency;
-    await resolveCurrencyPrecision(currency);   // true precision before any money math
+    await resolveCurrencyPrecision(currency);
 
-    // Independently VERIFY the one payment on-chain — abort to 'retry' on a transient error.
     let v;
     try {
       v = await escrowCore.verifyPayment(
@@ -431,7 +368,7 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
       }
     }
 
-    // ── SYNCHRONOUS commit section (no await): record + single-winner close atomically. ──
+    // ── SYNCHRONOUS commit section ──
     const pre = ledger.getPaymentsByRef(ref);
     if (pre.some(r => r.settle_state === 'closed')) {
       log('info', `ref ${ref} already settled — returning prior receipt`);
@@ -441,7 +378,7 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
       ledger.recordPayment({ tx_id: v.txId, ref, sender: v.sender, currency: v.currency, amount: v.paid,
         memo: p.memo, block_num: v.blockNum });
     } catch (e) {
-      if (e && e.code !== 'conflict') throw e; // conflict = already recorded — idempotent
+      if (e && e.code !== 'conflict') throw e;
     }
     const payRows = ledger.getPaymentsByRef(ref);
     if (payRows.length === 0) {
@@ -457,62 +394,32 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
 
     const verifiedAmount = payRows.reduce((s, r) => s + (Number(r.amount) || 0), 0);
     const now = nowFn();
-    const split = adapter.singlePaymentSplit(verifiedAmount, facts,
-      { ref, feeAccount: config.feeAccount, places: placesFor(currency) });
+    const places = placesFor(currency);
+    const split = adapter.singlePaymentSplit(verifiedAmount, facts, { ref, feeAccount: config.feeAccount, places });
 
-    let payoutTx = null, overall = 'settled';
-    for (const o of split.outflows) {
-      const { refund_id } = ledger.recordRefund({
-        ref, to_account: o.to_account, amount: o.amount, currency: o.currency, memo: o.memo, reason: o.reason });
-      try {
-        const { txId } = await escrowCore.disburse(
-          { to: o.to_account, amount: o.amount, currency: o.currency, memo: o.memo,
-            fromAccount: config.account, keyEnv: config.keyEnv, places: placesFor(currency) },
-          { client: deps.broadcastClient }
-        );
-        ledger.markRefundSettled(refund_id, 'sent', txId);
-        o.txId = txId; o.status = 'sent';
-        if (o.kind === 'payout') payoutTx = txId;
-      } catch (e) {
-        if (dispositionForDisburseError(e) === 'pending') {
-          o.status = 'pending'; if (overall === 'settled') overall = 'pending';
-          log('error', `disburse ${o.kind} → ${o.to_account} left PENDING (retryable ${e.code || 'net'}): ${e.message}`);
-        } else {
-          ledger.markRefundSettled(refund_id, 'failed', null);
-          o.status = 'failed'; overall = 'failed';
-          log('error', `disburse ${o.kind} → ${o.to_account} FAILED (permanent): ${e.message}`);
-        }
-      }
-    }
+    const { disburseTx, overall } = await disburseOutflows(ref, split.outflows, places);
 
     const receipt = escrowCore.buildSettlementReceipt({
-      ref, settlement: split.net, refund: 0, dust: 0,
-      currency, disburseTx: payoutTx, status: overall, createdAt: now });
+      ref, settlement: 0, refund: split.net, dust: 0,
+      currency, disburseTx, status: overall, createdAt: now });
     const signedReceipt = boxSkHex ? escrowCore.signReport(receipt, boxSkHex) : receipt;
 
     log('info', `settled ${ref} (single-payment): net=${split.net} fee=${split.fee} status=${overall}`);
     return { status: overall, ref, receipt: signedReceipt, outflows: split.outflows };
   }
 
-  // Crash-recovery: disburse any refund rows still 'pending' (e.g. a box that died after
-  // atomicClose+recordRefund but before disburse, or a no_key that was later provisioned).
-  // Mirrors escrow-core/scripts/dry-run-adversarial.js's recover phase. Idempotent.
-  // Retry every 'pending' refund row. Rows that land are marked 'sent'; when the LAST
-  // pending row of a ref completes this run, deps.onRefCompleted(ref, status) fires
-  // (status 'settled' unless any row of the ref ended 'failed') — start() wires that to
-  // publish an UPDATED settlement-receipt so the node can tell users the money moved
-  // (the original receipt said 'pending'; without this follow-up nobody ever learns).
+  // Crash-recovery: disburse any refund rows still 'pending'. IDEMPOTENCY PROBE FIRST:
+  // if this exact memo already went out from the escrow account, a prior attempt DID
+  // land (its response was lost) — mark 'sent', never re-broadcast. Inconclusive probe
+  // → skip this cycle rather than risk a double-pay. When a ref's LAST pending row
+  // completes, deps.onRefCompleted(ref, status) fires (start() wires it to publish a
+  // refreshed COMPLETION receipt so the node learns the money actually moved).
   async function disbursePending() {
     const pending = ledger.db.prepare("SELECT * FROM refunds WHERE status = 'pending'").all();
     let done = 0;
     const touched = new Set();
     const probeFn = deps.findOutgoingByMemo || escrowCore.findOutgoingByMemo;
     for (const r of pending) {
-      // IDEMPOTENCY PROBE FIRST: if this exact memo already went out from the escrow
-      // account, a prior attempt DID land (its response was just lost) — mark 'sent',
-      // never re-broadcast. An inconclusive probe (status:'error') means UNKNOWN, so we
-      // skip this row this cycle rather than risk a double-pay. This is what makes the
-      // transient→pending retry safe.
       if (probeFn) {
         let probe;
         try { probe = await probeFn(config.account, r.memo, r.currency); }
@@ -543,7 +450,6 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
       }
     }
     if (done) log('info', `recovery disbursed ${done} pending refund(s)`);
-    // Fire the completion hook for every touched ref that now has NO pending rows left.
     if (deps.onRefCompleted && touched.size) {
       const countPending = ledger.db.prepare("SELECT COUNT(*) AS n FROM refunds WHERE ref = ? AND status = 'pending'");
       const anyFailed    = ledger.db.prepare("SELECT COUNT(*) AS n FROM refunds WHERE ref = ? AND status = 'failed'");
@@ -559,10 +465,6 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
 
   // Wire the injected transport: every inbound event-report → handleReport → publish the receipt.
   async function start() {
-    // Default completion hook: when a ref's LAST pending row lands via the recovery
-    // retry, publish a REFRESHED signed receipt (status settled/failed, real numbers)
-    // to the expected reporter(s) — the original receipt said 'pending', and without
-    // this follow-up the node/users never learn the money actually moved.
     if (!deps.onRefCompleted && deps.transport && deps.transport.publish) {
       deps.onRefCompleted = async (ref, status) => {
         const receipt = receiptFromLedger(ref, status);
@@ -578,9 +480,6 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
       });
       log('info', 'escrow box listening for event-reports');
     }
-    // Periodic recovery: retry any 'pending' refund (a transient disburse failure) on a
-    // timer so a payout that couldn't broadcast lands as soon as the network recovers —
-    // without waiting for the next report or a restart. Idempotency-probe-guarded above.
     const retryMs = Number(deps.pendingRetryMs) || 60000;
     if (retryMs > 0) {
       const t = setInterval(() => { disbursePending().catch(e => log('error', `periodic disbursePending: ${e.message}`)); }, retryMs);

@@ -19,7 +19,7 @@ dst="$here/vendor/escrow-core"
 
 if [ ! -f "$src/package.json" ]; then
   echo "ERROR: escrow-core not found at $src" >&2
-  echo "       Clone it as a sibling of v4call-node (same parent dir) and retry." >&2
+  echo "       Clone it as a sibling of ipfs-gate-escrow (same parent dir) and retry." >&2
   exit 1
 fi
 

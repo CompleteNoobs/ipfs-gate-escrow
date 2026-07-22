@@ -1,12 +1,12 @@
-// ── v4call-escrow/index.js — the money-box boot entrypoint ────────────────────
+// ── ipfs-gate-escrow/index.js — the money-box boot entrypoint ─────────────────
 //
-// Runs the isolated v4call escrow box (the SETTLEMENT AUTHORITY). On its own minimal
-// Alpine host this is the ONLY process that holds the active key (V4CALL_ESCROW_KEY) and
+// Runs the isolated ipfs-gate escrow box (the SETTLEMENT AUTHORITY). On its own minimal
+// host this is the ONLY process that holds the active key (IPFS_GATE_ACTIVE_KEY) and
 // the only place a disbursement is computed and signed. It opens its OWN durable ledger,
 // trusts reports only from the node reporting-key(s) in ESCROW_EXPECTED_REPORTERS, and
-// settles each call's verified on-chain envelope (see escrow-box.js for the safety proof).
+// settles each claim's verified on-chain envelope (see escrow-box.js for the safety proof).
 //
-// GUARDRAIL: no Claude / no dev tooling on this host. Operate via logs + `docker exec`.
+// GUARDRAIL: no Claude / no dev tooling on a real-funds box. Operate via logs + SSH.
 
 'use strict';
 
@@ -41,22 +41,22 @@ function loadOrCreateBoxKey(keyPath) {
 }
 
 async function main() {
-  const account  = process.env.ESCROW_ACCOUNT || 'v4call-escrow';
-  const currency = (process.env.ESCROW_CURRENCY || 'HBD').toUpperCase();
-  const keyEnv   = 'V4CALL_ESCROW_KEY';
+  const account  = process.env.ESCROW_ACCOUNT || process.env.IPFS_GATE_HIVE_ACCOUNT || '';
+  if (!account) { console.error('[escrow-box] FATAL: ESCROW_ACCOUNT (or IPFS_GATE_HIVE_ACCOUNT) is required'); process.exit(1); }
+  const currency = (process.env.ESCROW_CURRENCY || process.env.PAYMENT_CURRENCY || 'CNOOBS').toUpperCase();
+  const keyEnv   = 'IPFS_GATE_ACTIVE_KEY';
   reqEnv(keyEnv);                                  // the active key MUST be present on the box
-  const feeAccount = reqEnv('FEE_ACCOUNT');
-  const dbPath   = process.env.ESCROW_DB_PATH || path.join(__dirname, 'data', 'v4call-escrow.db');
+  const feeAccount = (process.env.FEE_ACCOUNT || '').trim() || null;  // optional: only single-payment fees use it
+  const dbPath   = process.env.ESCROW_DB_PATH || path.join(__dirname, 'data', 'ipfs-gate-escrow.db');
   const keyPath  = process.env.ESCROW_KEY_PATH || path.join(__dirname, 'data', 'escrow-reporting-key.json');
   const relays   = (process.env.NOSTR_RELAYS || '').split(',').map(s => s.trim()).filter(Boolean);
   const reporters = (process.env.ESCROW_EXPECTED_REPORTERS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-  const maxDurationMin = parseInt(process.env.MAX_CALL_DURATION_MIN || '120', 10);
-  // Step 6 — call attestations. false (DEFAULT) = SHADOW mode: verify caller/callee
-  // co-signatures against on-chain posting keys, log + stamp the receipt, settle as
-  // before. true = ENFORCE: terminally reject call-ends with absent/invalid
-  // attestations. Promotion ladder (handover-decoupling §7): restricted circle +
-  // shadow → expert review → flip enforce → open fed. DO NOT flip without review.
-  const attestationEnforce = /^(1|true|yes)$/i.test((process.env.ATTESTATION_ENFORCE || '').trim());
+  // Box-authoritative settlement knobs (the node's quote-side env must match; on
+  // divergence THESE win — document in both .env.examples):
+  //   GUARDIAN_CANCEL_FEE_PCT  dormant-guardian anti-churn fee % (monolith default 0)
+  //   MIN_REFUND               dust floor below which a refund is retained (default 0.05)
+  // Both are read by escrow-core/pricing.js at require time and surfaced through the
+  // adapter; set them in the environment BEFORE this process starts.
 
   if (reporters.length === 0) { console.error('[escrow-box] FATAL: ESCROW_EXPECTED_REPORTERS is required (fail-closed: a money box must know which node key(s) it trusts)'); process.exit(1); }
   if (!reporters.every(r => /^[0-9a-f]{64}$/.test(r))) { console.error('[escrow-box] FATAL: ESCROW_EXPECTED_REPORTERS must be 64-hex schnorr pubkeys'); process.exit(1); }
@@ -70,7 +70,7 @@ async function main() {
 
   const boxSkHex = loadOrCreateBoxKey(keyPath);
   const boxPub   = escrowCore.getReportingPubkey(boxSkHex);
-  const adapter  = escrowCore.createV4callAdapter({ account, currency, keyEnv });
+  const adapter  = escrowCore.createIpfsGateAdapter({ account, currency, keyEnv });
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const ledger   = escrowCore.openLedger(dbPath, { adapterMigrations: adapter.ledgerMigrations() });
 
@@ -83,7 +83,7 @@ async function main() {
 
   const box = createEscrowBox({
     escrowCore, ledger, adapter,
-    config: { account, currency, keyEnv, feeAccount, expectedReporters: reporters, maxDurationMin, attestationEnforce },
+    config: { account, currency, keyEnv, feeAccount, expectedReporters: reporters },
     boxSkHex,
     deps: { transport },          // getTransaction/broadcastClient default to LIVE chain
     log,
@@ -91,8 +91,8 @@ async function main() {
 
   await box.start();
   console.log(`[escrow-box] escrow-core ${escrowCore.version} ready: @${account} (${currency}) · ledger ${dbPath}`);
-  console.log(`[escrow-box]   box reporting pubkey: ${boxPub}   ← the node must pin this to verify receipts`);
-  console.log(`[escrow-box]   trusts ${reporters.length} reporter key(s); fee → @${feeAccount}; ${relays.length} relay(s)`);
+  console.log(`[escrow-box]   box reporting pubkey: ${boxPub}   ← the node must pin this (ESCROW_BOX_PUBKEY) to verify receipts`);
+  console.log(`[escrow-box]   trusts ${reporters.length} reporter key(s); cancel fee ${adapter.cancelFeePct}% · dust floor ${adapter.minRefund}; ${relays.length} relay(s)`);
 
   const shutdown = () => { try { if (transport) transport.close(); ledger.close(); } catch {} process.exit(0); };
   process.on('SIGTERM', shutdown);
