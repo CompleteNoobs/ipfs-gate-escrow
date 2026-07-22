@@ -36,6 +36,12 @@ putting real value on it. Never install Claude/dev tooling on a real-funds box.
 # Clone BOTH repos as siblings (escrow-core is a <code>file:../</code> dependency):
 #: <code>git clone https://github.com/CompleteNoobs/escrow-core /opt/escrow-core</code>
 #: <code>git clone https://github.com/CompleteNoobs/ipfs-gate-escrow /opt/ipfs-gate-escrow</code>
+# <code>cd /opt/escrow-core && npm install --omit=dev</code> — REQUIRED on bare metal:
+  npm links the <code>file:../escrow-core</code> dep as a SYMLINK, so escrow-core's own
+  deps (@hiveio/dhive, better-sqlite3…) resolve from /opt/escrow-core/node_modules;
+  without this step the box crashes at boot with "Cannot find module '@hiveio/dhive'"
+  (found live on Alpine 3.23 / Node 24, 2026-07-22 — the Docker image avoids it with
+  <code>--install-links</code>).
 # <code>cd /opt/ipfs-gate-escrow && npm install --omit=dev</code>
 # <code>cp .env.example .env</code> and fill in (see Configuration below).
 # OpenRC service: copy v4call-escrow's <code>/etc/init.d/v4call-escrow</code> recipe, renaming
@@ -95,3 +101,9 @@ All in <code>.env</code> (see .env.example — authoritative):
 * '''strfry rejects subscriptions ("filter is not an object")''' —
   pool.subscribeMany takes a SINGLE filter object, not an array (nostr-transport
   carries the note; don't "fix" it back).
+* '''"Cannot find module '@hiveio/dhive'" at boot (bare metal)''' — you skipped
+  <code>npm install</code> inside /opt/escrow-core (the file: dep is a symlink;
+  see Deploy shape A step 4). Found live on Alpine 3.23 / Node 24, 2026-07-22.
+* '''<code>npm test</code> says "Cannot find module '…/test'" on Node ≥ 24''' —
+  fixed 2026-07-22: the script is now <code>node --test test/*.test.js</code>
+  (Node 24 stopped accepting a bare directory argument).
