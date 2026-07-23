@@ -68,6 +68,11 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
 
   const reject = (ref, reason) => { log('warn', `report rejected (ref=${ref}): ${reason}`); return { status: 'rejected', ref, reason }; };
 
+  // Transient outcome — the node will re-report. LOGGED because a silent retry
+  // loop is indistinguishable from a dead box in the logs (found live 2026-07-22:
+  // a malformed txid classified transient and the box "ignored" reports forever).
+  const retry = (ref, reason) => { log('warn', `report deferred (ref=${ref}): transient — will retry: ${reason}`); return { status: 'retry', ref, reason }; };
+
   // PERMANENT rejection of an AUTHORIZED, signature-valid report → also return a signed
   // status:'failed' receipt so the node's retry-until-received drainer gets a terminal
   // answer and stops republishing. Never used for the hard gates (bad sig / unauthorized
@@ -211,7 +216,7 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
           { getTransaction: deps.getTransaction }
         );
       } catch (e) {
-        if (isTransient(e)) return { status: 'retry', ref, reason: `verify ${p.txId}: ${e.message}` };
+        if (isTransient(e)) return retry(ref, `verify ${p.txId}: ${e.message}`);
         log('warn', `dropping payment ${p.txId} (structural verify failure): ${e.message}`);
         continue; // forged / wrong-memo payment can't enter the envelope
       }
@@ -219,7 +224,7 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
       const verifySidechain = deps.verifySidechain || escrowCore.verifySidechain;
       if (!escrowCore.isNativeCurrency(v.currency) && verifySidechain) {
         try { await verifySidechain(p.txId); }
-        catch (e) { if (isTransient(e)) return { status: 'retry', ref, reason: `sidechain ${p.txId}: ${e.message}` };
+        catch (e) { if (isTransient(e)) return retry(ref, `sidechain ${p.txId}: ${e.message}`);
                     log('warn', `dropping HE payment ${p.txId} (sidechain reject): ${e.message}`); continue; }
       }
       const purpose = (escrowCore.parseMemo(p.memo) || {}).purpose || p.purpose || 'upload';
@@ -356,14 +361,14 @@ function createEscrowBox({ escrowCore, ledger, adapter, config, boxSkHex, deps =
         { getTransaction: deps.getTransaction }
       );
     } catch (e) {
-      if (isTransient(e)) return { status: 'retry', ref, reason: `verify ${p.txId}: ${e.message}` };
+      if (isTransient(e)) return retry(ref, `verify ${p.txId}: ${e.message}`);
       return rejectTerminal(ref, `structural verify failure: ${e.message}`, currency);
     }
     const verifySidechain = deps.verifySidechain || escrowCore.verifySidechain;
     if (!escrowCore.isNativeCurrency(v.currency) && verifySidechain) {
       try { await verifySidechain(p.txId); }
       catch (e) {
-        if (isTransient(e)) return { status: 'retry', ref, reason: `sidechain ${p.txId}: ${e.message}` };
+        if (isTransient(e)) return retry(ref, `sidechain ${p.txId}: ${e.message}`);
         return rejectTerminal(ref, `sidechain reject: ${e.message}`, currency);
       }
     }
