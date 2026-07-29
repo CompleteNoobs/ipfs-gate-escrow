@@ -17,8 +17,10 @@
 //
 // Requires nostr-tools v2 (ESM). Loaded from index.js via dynamic import.
 
-import { SimplePool } from 'nostr-tools/pool';
+import { SimplePool, useWebSocketImplementation } from 'nostr-tools/pool';
 import { finalizeEvent, verifyEvent } from 'nostr-tools/pure';
+import WebSocket from 'ws';
+useWebSocketImplementation(WebSocket);
 
 // Dedicated kind for escrow-protocol/0.1 envelopes (regular, relayed events). Distinct from
 // the federation kinds (1314 fedmsg / 30078 discovery) so relays/filters never cross them.
