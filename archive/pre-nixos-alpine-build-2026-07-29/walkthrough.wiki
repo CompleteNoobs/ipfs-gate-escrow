@@ -1,0 +1,109 @@
+{{:LICENCE_HEADER_MIT}}
+
+
+= ipfs-gate-escrow — deploy the isolated money box =
+
+From CompleteNoobs
+
+''Skeleton (Phase 2 of decoupling-notes/ipfs-gate-split-plan.md). The production
+pass (Phase 7) folds real symptom-first entries into Common problems. The
+host-hardening recipe is IDENTICAL to the proven v4call box — follow
+v4call-escrow/walkthrough.wiki Steps 1–4 (patched minimal Alpine, key-only SSH,
+nftables default-deny inbound, unprivileged user) and swap in the ipfs-gate
+bits below.''
+
+== What this is ==
+
+The settlement authority for a decoupled ipfs-gate: the ONLY holder of the
+escrow account's active key. The gate node (ipfs-gate-node, <code>ESCROW_MODE=box</code>)
+is keyless — it sends signed claim-settle reports over Nostr (kind-31337,
+escrow-protocol/0.1); this box independently re-verifies every payment
+on-chain, applies the settlement cap, disburses the refund, and returns a
+signed receipt. No inbound ports: outbound HTTPS (Hive RPC) + WSS (relay) only.
+
+'''Topology guidance''' (v4call owner decision 2026-06-16, carried over): with
+REAL funds, run the box on its own minimal host, separate from the node — a
+node compromise then cannot drain the key. The single-server combined stack
+(node + escrow as separate containers on one box, <code>--profile escrow</code> in
+ipfs-gate-node's compose) is supported and fine for TEST-token dry-runs and
+small self-hosted setups; understand the reduced blast-radius isolation before
+putting real value on it. Never install Claude/dev tooling on a real-funds box.
+
+== Deploy shape A — bare metal (Alpine + OpenRC; the v4call-proven path) ==
+
+# Harden the host per v4call-escrow/walkthrough.wiki Steps 1–4.
+# <code>apk add nodejs npm git python3 make g++</code> (build deps for better-sqlite3)
+# Clone BOTH repos as siblings (escrow-core is a <code>file:../</code> dependency):
+#: <code>git clone https://github.com/CompleteNoobs/escrow-core /opt/escrow-core</code>
+#: <code>git clone https://github.com/CompleteNoobs/ipfs-gate-escrow /opt/ipfs-gate-escrow</code>
+# <code>cd /opt/escrow-core && npm install --omit=dev</code> — REQUIRED on bare metal:
+  npm links the <code>file:../escrow-core</code> dep as a SYMLINK, so escrow-core's own
+  deps (@hiveio/dhive, better-sqlite3…) resolve from /opt/escrow-core/node_modules;
+  without this step the box crashes at boot with "Cannot find module '@hiveio/dhive'"
+  (found live on Alpine 3.23 / Node 24, 2026-07-22 — the Docker image avoids it with
+  <code>--install-links</code>).
+# <code>cd /opt/ipfs-gate-escrow && npm install --omit=dev</code>
+# <code>cp .env.example .env</code> and fill in (see Configuration below).
+# OpenRC service: copy v4call-escrow's <code>/etc/init.d/v4call-escrow</code> recipe, renaming
+  v4call-escrow → ipfs-gate-escrow (the key var is IPFS_GATE_ACTIVE_KEY, read from .env).
+# <code>rc-update add ipfs-gate-escrow && rc-service ipfs-gate-escrow start</code>
+
+== Deploy shape B — Docker (NEW in the ipfs-gate decoupling) ==
+
+# Clone both repos as siblings (as above), <code>cp .env.example .env</code>, fill in.
+# <code>npm run docker:prep</code>  (vendors ../escrow-core into the build context)
+# <code>docker compose up -d --build</code>
+# Logs: <code>docker logs -f ipfs-gate-escrow</code>
+
+Updates (either shape): <code>git -C /opt/escrow-core pull && git -C /opt/ipfs-gate-escrow pull</code>
+then restart the service / <code>npm run docker:build && docker compose up -d</code>.
+
+== Configuration ==
+
+All in <code>.env</code> (see .env.example — authoritative):
+
+* <code>ESCROW_ACCOUNT</code> — the escrow Hive account (node-side name: IPFS_GATE_HIVE_ACCOUNT).
+* <code>IPFS_GATE_ACTIVE_KEY</code> — THE money key. This host only. Never on the node.
+* <code>ESCROW_CURRENCY</code> + <code>ESCROW_TOKEN_PRECISION</code> — HE tokens (CNOOBS=3) are FATAL without the precision lock.
+* <code>ESCROW_EXPECTED_REPORTERS</code> — fail-closed allow-list of node reporting pubkeys.
+* <code>NOSTR_RELAYS</code> — default wss://nostr.v4call.com.
+* <code>GUARDIAN_CANCEL_FEE_PCT</code> / <code>MIN_REFUND</code> — BOX-AUTHORITATIVE settlement
+  knobs; set the node's quote-side env to the same values or quotes and
+  settlements drift (the box wins).
+
+== Wiring the two pubkeys ==
+
+# Boot the box once — it logs <code>box reporting pubkey: &lt;64-hex&gt;</code>.
+  Put that in the NODE's <code>ESCROW_BOX_PUBKEY</code>.
+# Boot the node in box mode once — it logs its node reporting pubkey.
+  Put that in the BOX's <code>ESCROW_EXPECTED_REPORTERS</code>. Restart both.
+
+== Smoke checks ==
+
+* Boot without IPFS_GATE_ACTIVE_KEY → FATAL (refuses to start).
+* Boot without ESCROW_EXPECTED_REPORTERS → FATAL (fail-closed).
+* Non-native currency without ESCROW_TOKEN_PRECISION → FATAL.
+* <code>npm test</code> (20 box tests) and <code>npm run dry-run</code>
+  (adversarial guards, "ALL GUARDS HELD") both green on the dev host
+  before any deploy that will touch real value.
+
+== Common problems ==
+
+''(Seeded from the v4call box; Phase 7 adds ipfs-gate-specific entries as found.)''
+
+* '''Payouts stuck pending''' — usually the key missing from .env or a Hive RPC
+  outage. The 60s recovery loop retries with an on-chain memo-probe first, so a
+  landed-but-lost-response refund is never double-paid; fix the cause and wait a
+  cycle (or restart the service).
+* '''Relay down''' — settlements stall safely: the node's drainer republishes
+  until a receipt verifies; refunds stay durable-pending. Check
+  <code>NOSTR_RELAYS</code> and the relay host.
+* '''strfry rejects subscriptions ("filter is not an object")''' —
+  pool.subscribeMany takes a SINGLE filter object, not an array (nostr-transport
+  carries the note; don't "fix" it back).
+* '''"Cannot find module '@hiveio/dhive'" at boot (bare metal)''' — you skipped
+  <code>npm install</code> inside /opt/escrow-core (the file: dep is a symlink;
+  see Deploy shape A step 4). Found live on Alpine 3.23 / Node 24, 2026-07-22.
+* '''<code>npm test</code> says "Cannot find module '…/test'" on Node ≥ 24''' —
+  fixed 2026-07-22: the script is now <code>node --test test/*.test.js</code>
+  (Node 24 stopped accepting a bare directory argument).
